@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from app.config import (
     API_KEY, ELVANSE_DEFAULT_DOSE_MG, MATE_CAFFEINE_MG,
     MEDIKINET_DEFAULT_DOSE_MG, MEDIKINET_RETARD_DEFAULT_DOSE_MG,
+    CO_DAFALGAN_DEFAULT_DOSE_MG,
     USER_WEIGHT_KG, USER_HEIGHT_CM, USER_AGE, USER_IS_FASTING,
 )
 from app.core.database import (
@@ -34,7 +35,7 @@ from app.core.database import (
 )
 from app.core.bio_engine import (
     compute_bio_score, generate_day_curve,
-    elvanse_effect_curve,
+    elvanse_effect_curve, check_ddi_warnings,
 )
 
 router = APIRouter(prefix="/api")
@@ -50,7 +51,7 @@ def verify_api_key(x_api_key: str = Header(default="")):
 # --- Models ---
 
 class IntakeRequest(BaseModel):
-    substance: str = Field(..., pattern="^(elvanse|mate|medikinet|medikinet_retard|other)$")
+    substance: str = Field(..., pattern="^(elvanse|mate|medikinet|medikinet_retard|co_dafalgan|other)$")
     dose_mg: Optional[float] = None
     notes: str = ""
     timestamp: Optional[str] = None
@@ -68,6 +69,12 @@ class SubjectiveLogRequest(BaseModel):
     energy: int = Field(..., ge=1, le=10)
     appetite: Optional[int] = Field(None, ge=1, le=10)
     inner_unrest: Optional[int] = Field(None, ge=1, le=10)
+    # Migraene-Tracking (IHS-Kriterien)
+    pain_severity: Optional[int] = Field(None, ge=0, le=10)
+    aura_duration_min: Optional[int] = Field(None, ge=0)
+    aura_type: Optional[str] = Field(None, pattern="^(zickzack|skotome|flimmern|other|)$")
+    photophobia: Optional[bool] = None
+    phonophobia: Optional[bool] = None
     tags: list[str] = []
     timestamp: Optional[str] = None
 
@@ -108,18 +115,37 @@ def log_intake(req: IntakeRequest):
             dose = MEDIKINET_DEFAULT_DOSE_MG
         elif req.substance == "medikinet_retard":
             dose = MEDIKINET_RETARD_DEFAULT_DOSE_MG
+        elif req.substance == "co_dafalgan":
+            dose = CO_DAFALGAN_DEFAULT_DOSE_MG
 
     row_id = insert_intake(req.substance, dose, req.notes, req.timestamp)
-    return {"id": row_id, "substance": req.substance, "dose_mg": dose, "status": "ok"}
+
+    # Check DDI warnings on intake
+    ddi_warnings = []
+    if req.substance == "co_dafalgan":
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        intakes = query_intakes(f"{today}T00:00:00", f"{today}T23:59:59")
+        ddi_warnings = check_ddi_warnings(intakes, now)
+
+    result = {"id": row_id, "substance": req.substance, "dose_mg": dose, "status": "ok"}
+    if ddi_warnings:
+        result["warnings"] = ddi_warnings
+    return result
 
 
 @router.post("/log", dependencies=[Depends(verify_api_key)])
 def log_subjective(req: SubjectiveLogRequest):
-    """Log a subjective assessment (focus, mood, energy, appetite, inner_unrest)."""
+    """Log a subjective assessment (focus, mood, energy, appetite, inner_unrest, migraine)."""
     tags_json = json.dumps(req.tags)
     row_id = insert_subjective_log(
         req.focus, req.mood, req.energy, tags_json, req.timestamp,
         appetite=req.appetite, inner_unrest=req.inner_unrest,
+        pain_severity=req.pain_severity,
+        aura_duration_min=req.aura_duration_min,
+        aura_type=req.aura_type if req.aura_type else None,
+        photophobia=int(req.photophobia) if req.photophobia is not None else None,
+        phonophobia=int(req.phonophobia) if req.phonophobia is not None else None,
     )
     return {"id": row_id, "status": "ok"}
 
@@ -218,15 +244,22 @@ def get_bio_score(
     today = target.strftime("%Y-%m-%d")
     intakes = query_intakes(f"{today}T00:00:00", f"{today}T23:59:59")
 
-    # Get sleep data from latest health snapshot if not provided
+    # Get health data (sleep + HRV) from latest snapshot if not provided
+    hrv_ms = None
+    resting_hr = None
     if sleep_duration_min is None:
         latest = get_latest_health_snapshot()
         if latest:
             sleep_duration_min = latest.get("sleep_duration")
             if sleep_confidence is None:
                 sleep_confidence = latest.get("sleep_confidence")
+            hrv_ms = latest.get("hrv")
+            resting_hr = latest.get("resting_hr")
 
-    result = compute_bio_score(target, intakes, sleep_duration_min, sleep_confidence)
+    result = compute_bio_score(
+        target, intakes, sleep_duration_min, sleep_confidence,
+        hrv_ms=hrv_ms, resting_hr=resting_hr,
+    )
     return result
 
 
@@ -249,16 +282,21 @@ def get_bio_curve(
     day_str = target_date.strftime("%Y-%m-%d")
     intakes = query_intakes(f"{day_str}T00:00:00", f"{day_str}T23:59:59")
 
-    # Sleep data
+    # Health data (sleep + HRV)
+    hrv_ms = None
+    resting_hr = None
     if sleep_duration_min is None:
         latest = get_latest_health_snapshot()
         if latest:
             sleep_duration_min = latest.get("sleep_duration")
             if sleep_confidence is None:
                 sleep_confidence = latest.get("sleep_confidence")
+            hrv_ms = latest.get("hrv")
+            resting_hr = latest.get("resting_hr")
 
     curve = generate_day_curve(
-        target_date, intakes, sleep_duration_min, sleep_confidence, interval
+        target_date, intakes, sleep_duration_min, sleep_confidence, interval,
+        hrv_ms=hrv_ms, resting_hr=resting_hr,
     )
     return {"date": day_str, "interval_minutes": interval, "points": curve}
 
@@ -279,6 +317,8 @@ def ha_intake_webhook(req: IntakeRequest):
             dose = MEDIKINET_DEFAULT_DOSE_MG
         elif req.substance == "medikinet_retard":
             dose = MEDIKINET_RETARD_DEFAULT_DOSE_MG
+        elif req.substance == "co_dafalgan":
+            dose = CO_DAFALGAN_DEFAULT_DOSE_MG
 
     row_id = insert_intake(req.substance, dose, req.notes, req.timestamp)
     print(
@@ -346,6 +386,7 @@ def status():
     return {
         "service": "bio-dashboard",
         "status": "ok",
+        "version": "2.0.0",
         "timestamp": datetime.now().isoformat(),
         "user": {
             "weight_kg": USER_WEIGHT_KG,
@@ -353,6 +394,24 @@ def status():
             "age": USER_AGE,
             "fasting": USER_IS_FASTING,
         },
+        "model": "allometric-cascade-v2",
+    }
+
+
+@router.get("/ddi-check", dependencies=[Depends(verify_api_key)])
+def ddi_check():
+    """
+    Check current drug-drug interactions based on today's intakes.
+    Returns active DDI warnings.
+    """
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    intakes = query_intakes(f"{today}T00:00:00", f"{today}T23:59:59")
+    warnings = check_ddi_warnings(intakes, now)
+    return {
+        "timestamp": now.isoformat(),
+        "warnings": warnings,
+        "warning_count": len(warnings),
     }
 
 
