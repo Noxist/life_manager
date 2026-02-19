@@ -10,6 +10,7 @@ import router from '@ohos.router';
 import { Constants } from '../common/Constants';
 import { StorageService } from '../service/StorageService';
 import { HASyncService } from '../service/HASyncService';
+import { ServerService } from '../service/ServerService';
 import { WaterEntry, DayLog } from '../model/WaterModel';
 
 @Entry
@@ -35,6 +36,11 @@ struct ManageEntriesPage {
     this.entries = log.entries.slice().reverse();
     this.totalIntake = log.totalIntake;
     HASyncService.syncToHA(log);
+    // Trigger server sync after delete
+    const serverOn: boolean = await StorageService.isServerEnabled();
+    if (serverOn) {
+      ServerService.reportStatus();
+    }
   }
 
   private formatTime(timestamp: number): string {
@@ -73,26 +79,33 @@ struct ManageEntriesPage {
             ForEach(this.entries, (entry: WaterEntry) => {
               Row() {
                 Text(`${entry.amount} ml`)
-                  .fontSize(11)
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Medium)
                   .fontColor(Constants.COLOR_TEXT_PRIMARY)
                   .layoutWeight(1)
 
                 Text(this.formatTime(entry.timestamp))
                   .fontSize(10)
                   .fontColor(Constants.COLOR_TEXT_SECONDARY)
-                  .margin({ right: 8 })
+                  .margin({ right: 6 })
 
                 Text('✕')
-                  .fontSize(12)
+                  .fontSize(16)
+                  .fontWeight(FontWeight.Bold)
                   .fontColor(Constants.COLOR_WARNING)
+                  .width(36)
+                  .height(36)
+                  .textAlign(TextAlign.Center)
+                  .borderRadius(18)
+                  .backgroundColor(Constants.COLOR_PROGRESS_BG)
                   .onClick(() => { this.deleteEntry(entry.id); })
               }
               .width('100%')
-              .height(28)
-              .padding({ left: 8, right: 8 })
-              .borderRadius(6)
+              .height(44)
+              .padding({ left: 10, right: 6 })
+              .borderRadius(10)
               .backgroundColor(Constants.COLOR_SURFACE)
-              .margin({ bottom: 4 })
+              .margin({ bottom: 6 })
             }, (entry: WaterEntry) => entry.id)
           }
           .width('100%')

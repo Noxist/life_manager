@@ -12,6 +12,7 @@ import router from '@ohos.router';
 import { Constants } from '../common/Constants';
 import { StorageService } from '../service/StorageService';
 import { HASyncService } from '../service/HASyncService';
+import { ServerService } from '../service/ServerService';
 
 @Entry
 @Component
@@ -26,6 +27,7 @@ struct SettingsPage {
   @State private reminderEnabled: boolean = false;
   @State private reminderInterval: number = Constants.DEFAULT_REMINDER_INTERVAL;
   @State private connectionStatus: string = '';
+  @State private serverConnectionStatus: string = '';
   @State private editingGoal: boolean = false;
   @State private editingDrinks: boolean = false;
 
@@ -475,50 +477,88 @@ struct SettingsPage {
         .clip(true)
 
         // ═══════════════════════════════════════════
-        // Health Server — toggle with status subtitle
+        // Health Server — toggle with test button
         // ═══════════════════════════════════════════
-        Row() {
-          this.settingIcon('⬡', '#546E7A')
+        Column() {
+          Row() {
+            this.settingIcon('⛅', '#546E7A')
 
-          Column() {
-            Text('Health Server')
-              .fontSize(15)
+            Column() {
+              Text('Health Server')
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(Constants.COLOR_TEXT_PRIMARY)
+              if (this.serverEnabled) {
+                Text(this.serverUrl.length > 0 ? '● Connected' : '○ No URL set')
+                  .fontSize(11)
+                  .fontColor(
+                    this.serverUrl.length > 0
+                      ? Constants.COLOR_SUCCESS
+                      : Constants.COLOR_TEXT_SECONDARY
+                  )
+                  .margin({ top: 2 })
+              }
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+
+            Toggle({ type: ToggleType.Switch, isOn: this.serverEnabled })
+              .selectedColor(Constants.COLOR_PRIMARY)
+              .onChange((isOn: boolean) => {
+                this.serverEnabled = isOn;
+                StorageService.setServerEnabled(isOn);
+              })
+          }
+          .width('100%')
+          .height(60)
+          .padding({ left: 14, right: 14 })
+          .alignItems(VerticalAlign.Center)
+
+          if (this.serverEnabled) {
+            Divider()
+              .color(Constants.COLOR_PROGRESS_BG)
+              .margin({ left: 14, right: 14 })
+
+            Button('Test Connection')
+              .fontSize(13)
               .fontWeight(FontWeight.Medium)
+              .height(42)
+              .borderRadius(21)
+              .backgroundColor(Constants.COLOR_PROGRESS_BG)
               .fontColor(Constants.COLOR_TEXT_PRIMARY)
-            if (this.serverEnabled) {
-              Text(this.serverUrl.length > 0 ? '● Connected' : '○ No URL set')
-                .fontSize(11)
+              .width('80%')
+              .margin({ top: 8, bottom: 10 })
+              .onClick(async () => {
+                this.serverConnectionStatus = 'Testing...';
+                const result = await ServerService.testConnection();
+                this.serverConnectionStatus = result.success ? '✓ Connected' : result.message;
+                setTimeout(() => { this.serverConnectionStatus = ''; }, 3000);
+              })
+
+            if (this.serverConnectionStatus !== '') {
+              Text(this.serverConnectionStatus)
+                .fontSize(12)
                 .fontColor(
-                  this.serverUrl.length > 0
+                  this.serverConnectionStatus.startsWith('✓')
                     ? Constants.COLOR_SUCCESS
-                    : Constants.COLOR_TEXT_SECONDARY
+                    : Constants.COLOR_WARNING
                 )
-                .margin({ top: 2 })
+                .margin({ bottom: 8 })
+                .textAlign(TextAlign.Center)
+                .width('100%')
             }
           }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start)
-
-          Toggle({ type: ToggleType.Switch, isOn: this.serverEnabled })
-            .selectedColor(Constants.COLOR_PRIMARY)
-            .onChange((isOn: boolean) => {
-              this.serverEnabled = isOn;
-              StorageService.setServerEnabled(isOn);
-            })
         }
-        .width('100%')
-        .height(60)
-        .padding({ left: 14, right: 14 })
-        .alignItems(VerticalAlign.Center)
         .backgroundColor(Constants.COLOR_SURFACE)
         .borderRadius(16)
         .margin({ bottom: 8 })
+        .clip(true)
 
         // ═══════════════════════════════════════════
         // Manage Entries — navigate to detail page
         // ═══════════════════════════════════════════
         Row() {
-          this.settingIcon('☰', '#6A1B9A')
+          this.settingIcon('📋', '#6A1B9A')
 
           Text('Manage Entries')
             .fontSize(15)

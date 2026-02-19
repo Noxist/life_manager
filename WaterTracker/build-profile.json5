@@ -7,11 +7,11 @@
         "material": {
           "certpath": "C:\\Users\\Wissenschaftswoche\\.ohos\\config\\default_WaterTracker_eHvfkrjnGLxiNsvZHvZgLztT5qet70fSJ1gA1XnX_78=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001956907A37DB2C542FDFF8932921084C4A2C8F80AAFF14846116B6BAA6E6D0555E9F17889FB0",
+          "keyPassword": "0000001B557861E0A2179CFA2F4654242057D95601ECC79F115BAEF8692E93F132C326CBD73E6D29719840",
           "profile": "C:\\Users\\Wissenschaftswoche\\.ohos\\config\\default_WaterTracker_eHvfkrjnGLxiNsvZHvZgLztT5qet70fSJ1gA1XnX_78=.p7b",
           "signAlg": "SHA256withECDSA",
           "storeFile": "C:\\Users\\Wissenschaftswoche\\.ohos\\config\\default_WaterTracker_eHvfkrjnGLxiNsvZHvZgLztT5qet70fSJ1gA1XnX_78=.p12",
-          "storePassword": "00000019585C4AAEE9C268DBD2BE6FE24A1C5D7A517241899B00455F19906D66FD22B380B9DAA7E006"
+          "storePassword": "0000001B5CC350F099EDF2491B75BAC811438D1CD59FBEC26586A99242A7471D3F364BFC41CB545F394C30"
         }
       }
     ],

@@ -143,6 +143,7 @@ def assess_hydration(
     wake_hour: float = 7.0,
     sleep_hour: float = 23.0,
     is_fasting: bool = USER_IS_FASTING,
+    recent_intake_30min_ml: int = 0,
 ) -> dict:
     """
     Assess current hydration status and generate a coaching instruction.
@@ -155,6 +156,10 @@ def assess_hydration(
       deficit_ml: int  — how far behind schedule
       pacing_ml_per_hour: int
       status: str — on_track / behind / critical / overhydrated / goal_reached
+
+    If recent_intake_30min_ml > 500, deficit messages are suppressed because
+    the velocity check will handle the warning independently. This prevents
+    the "behind schedule" message from appearing immediately after a large intake.
     """
     if now is None:
         now = datetime.now()
@@ -163,6 +168,15 @@ def assess_hydration(
     expected = expected_intake_at_hour(hour, goal_ml, wake_hour, sleep_hour, is_fasting)
     deficit = int(expected - current_intake_ml)
     pct = (current_intake_ml / goal_ml * 100) if goal_ml > 0 else 0
+
+    # Suppress deficit messages after rapid intake (>500 ml in 30 min).
+    # The velocity check handles the warning; showing "behind schedule"
+    # right after the user just drank a lot is confusing.
+    if recent_intake_30min_ml > 500 and deficit > 0:
+        remaining_hours = max(0.5, sleep_hour - hour)
+        remaining_ml = max(0, goal_ml - current_intake_ml)
+        pacing = int(remaining_ml / remaining_hours) if remaining_hours > 0 else 0
+        return _build_result("", 0, "none", 0, deficit, pacing, "on_track", pct)
 
     # Remaining hours in the day
     remaining_hours = max(0.5, sleep_hour - hour)
@@ -268,6 +282,32 @@ def _build_result(
         "status": status,
         "progress_pct": round(pct, 1),
     }
+
+
+# ── Recent intake window helper ───────────────────────────────────────
+
+def recent_intake_in_window(
+    water_events: list[dict],
+    window_minutes: int = 30,
+    now: Optional[datetime] = None,
+) -> int:
+    """
+    Sum water intake in the last `window_minutes` minutes.
+    Returns total ml consumed in that window.
+    """
+    if now is None:
+        now = datetime.now()
+    cutoff = now - timedelta(minutes=window_minutes)
+    total = 0
+    for ev in water_events:
+        ts = ev.get("timestamp", "")
+        try:
+            ev_time = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            continue
+        if ev_time >= cutoff and ev_time <= now:
+            total += ev.get("amount_ml", 0)
+    return total
 
 
 # ── Intake velocity check (overhydration protection) ─────────────────

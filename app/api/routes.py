@@ -41,6 +41,7 @@ from app.core.database import (
     get_last_water_event,
     delete_water_event,
     reset_todays_water,
+    delete_last_water_event_today,
     upsert_water_goal,
     get_water_goal,
     get_water_goals_range,
@@ -57,6 +58,7 @@ from app.core.water_engine import (
     compute_daily_goal,
     assess_hydration,
     check_intake_velocity,
+    recent_intake_in_window,
     detect_dehydration_from_vitals,
     hydration_bio_score_modifier,
     generate_hydration_curve,
@@ -541,7 +543,79 @@ async def water_report_endpoint(request: FastAPIRequest):
             )
             log.info("Persisted +%d ml delta (DB was %d, watch reports %d)", delta, db_total, watch_intake)
 
-    return {"status": "ok"}
+    # ── Compute instruction inline (saves the watch a second HTTP call) ──
+    now = datetime.now()
+    goal_data = _compute_today_goal()
+    computed_goal = goal_data["goal_ml"]
+    intake = watch_intake if watch_intake > 0 else get_todays_water_total()
+
+    # Parse last drink time
+    last_drink = None
+    raw_last = data.get("last_drink_time", "")
+    if raw_last:
+        try:
+            from dateutil.parser import parse as parse_date
+            last_drink = parse_date(raw_last)
+        except (ValueError, ImportError):
+            try:
+                last_drink = datetime.fromisoformat(raw_last.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+
+    # Fetch today's water events for velocity + recent-intake checks
+    water_events = get_todays_water_events()
+    recent_30 = recent_intake_in_window(water_events, window_minutes=30, now=now)
+
+    assessment = assess_hydration(
+        current_intake_ml=intake,
+        goal_ml=computed_goal,
+        now=now,
+        last_drink_time=last_drink,
+        recent_intake_30min_ml=recent_30,
+    )
+
+    velocity = check_intake_velocity(water_events, now)
+
+    message = assessment["message"]
+    priority = assessment["priority"]
+    amount = assessment["recommended_amount"]
+    deadline = assessment["deadline_minutes"]
+
+    if velocity["alert"]:
+        message = velocity["message"]
+        priority = "critical"
+        amount = 0
+        deadline = 0
+
+    watch_goal = data.get("daily_goal", 0)
+    target_override = computed_goal if computed_goal != watch_goal else 0
+
+    curve_data = generate_hydration_curve(
+        current_intake_ml=intake,
+        goal_ml=computed_goal,
+        now=now,
+    )
+
+    velocity_warning = {
+        "alert": velocity["alert"],
+        "message": velocity.get("message", ""),
+        "recent_ml": velocity.get("last_60min_ml", 0),
+        "window_minutes": 60,
+    }
+
+    instruction = {
+        "message": message,
+        "recommended_amount": amount,
+        "priority": priority,
+        "deadline_minutes": deadline,
+        "daily_target_override": target_override,
+        "timestamp": now.isoformat(),
+        "hydration_curve": curve_data,
+        "velocity_warning": velocity_warning,
+        "events_today": len(water_events),
+    }
+
+    return {"status": "ok", "instruction": instruction}
 
 
 @router.get("/water/instruction")
@@ -587,17 +661,19 @@ async def water_instruction_endpoint(
             except ValueError:
                 pass
 
-    # Get hydration assessment
+    # Check intake velocity (overhydration protection)
+    water_events = get_todays_water_events()
+    velocity = check_intake_velocity(water_events, now)
+    recent_30 = recent_intake_in_window(water_events, window_minutes=30, now=now)
+
+    # Get hydration assessment (with rapid-intake suppression)
     assessment = assess_hydration(
         current_intake_ml=intake,
         goal_ml=computed_goal,
         now=now,
         last_drink_time=last_drink,
+        recent_intake_30min_ml=recent_30,
     )
-
-    # Check intake velocity (overhydration protection)
-    water_events = get_todays_water_events()
-    velocity = check_intake_velocity(water_events, now)
 
     # Override with velocity alert if needed
     message = assessment["message"]
@@ -622,6 +698,14 @@ async def water_instruction_endpoint(
         now=now,
     )
 
+    # Velocity warning as a separate structured field
+    velocity_warning = {
+        "alert": velocity["alert"],
+        "message": velocity.get("message", ""),
+        "recent_ml": velocity.get("last_60min_ml", 0),
+        "window_minutes": 60,
+    }
+
     return {
         "message": message,
         "recommended_amount": amount,
@@ -630,6 +714,8 @@ async def water_instruction_endpoint(
         "daily_target_override": target_override,
         "timestamp": now.isoformat(),
         "hydration_curve": curve_data,
+        "velocity_warning": velocity_warning,
+        "events_today": len(water_events),
     }
 
 
@@ -685,6 +771,35 @@ def delete_water_intake(event_id: int):
     return {"deleted": event_id, "status": "ok"}
 
 
+@router.delete("/water/intake/last")
+async def delete_last_water_intake(request: FastAPIRequest):
+    """
+    Delete the most recent water event for today.
+    Used by the watch's Undo feature to propagate deletions to the server DB.
+    """
+    # Verify auth (same as watch endpoints)
+    auth = request.headers.get("authorization", "")
+    token = WATER_WATCH_TOKEN
+    if token and auth != f"Bearer {token}" and auth != token:
+        api_key = request.headers.get("x-api-key", "")
+        if API_KEY and api_key != API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    deleted = delete_last_water_event_today()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="No water events today")
+
+    import logging
+    log = logging.getLogger("bio.water")
+    log.info("Deleted last water event: %d ml (id=%d)", deleted["amount_ml"], deleted["id"])
+
+    return {
+        "status": "ok",
+        "deleted": deleted,
+        "new_total_ml": get_todays_water_total(),
+    }
+
+
 @router.post("/water/reset", dependencies=[Depends(verify_api_key)])
 def reset_water_today():
     """Delete all water events for today, resetting intake to 0."""
@@ -735,11 +850,13 @@ def water_status_endpoint():
         except (ValueError, KeyError):
             pass
 
+    recent_30 = recent_intake_in_window(events, window_minutes=30, now=now)
     assessment = assess_hydration(
         current_intake_ml=total_ml,
         goal_ml=goal_data["goal_ml"],
         now=now,
         last_drink_time=last_drink,
+        recent_intake_30min_ml=recent_30,
     )
     velocity = check_intake_velocity(events, now)
 

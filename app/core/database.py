@@ -489,6 +489,22 @@ def reset_todays_water() -> int:
         return cur.rowcount
 
 
+def delete_last_water_event_today() -> Optional[dict]:
+    """Delete the most recent water event for today. Returns the deleted row or None."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM water_events WHERE timestamp LIKE ? ORDER BY timestamp DESC LIMIT 1",
+            (f"{today}%",),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        event = dict(row)
+        cur.execute("DELETE FROM water_events WHERE id=?", (event["id"],))
+        return event
+
+
 # --- Water goals ---
 
 def upsert_water_goal(date: str, goal_ml: int, base_ml: int = 0,

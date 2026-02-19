@@ -27,6 +27,11 @@ class WatchStatusReport {
   public timestamp: string = '';
 }
 
+class ServerTestResult {
+  public success: boolean = false;
+  public message: string = '';
+}
+
 function buildServerHeader(token: string): object {
   if (token.length > 0) {
     return JSON.parse(`{"Authorization":"Bearer ${token}","Content-Type":"application/json"}`);
@@ -130,6 +135,48 @@ export class ServerService {
     } catch (err) {
       hilog.error(0x0000, TAG, 'Fetch error: %{public}s', String(err));
       return null;
+    } finally {
+      httpRequest.destroy();
+    }
+  }
+
+  /**
+   * Quick connectivity check — GETs /api/status which returns service info.
+   */
+  public static async testConnection(): Promise<ServerTestResult> {
+    const url: string = await StorageService.getServerUrl();
+    const token: string = await StorageService.getServerToken();
+    const result: ServerTestResult = new ServerTestResult();
+    if (url.length === 0) {
+      result.success = false;
+      result.message = 'No server URL';
+      return result;
+    }
+
+    const httpRequest = http.createHttp();
+    try {
+      const response = await httpRequest.request(`${url}/api/status`, {
+        method: http.RequestMethod.GET,
+        header: buildServerHeader(token),
+        connectTimeout: 10000,
+        readTimeout: 10000
+      } as http.HttpRequestOptions);
+
+      if (response.responseCode === 200) {
+        result.success = true;
+        result.message = 'Connected';
+      } else if (response.responseCode === 401) {
+        result.success = false;
+        result.message = 'Invalid token (401)';
+      } else {
+        result.success = false;
+        result.message = `HTTP ${response.responseCode}`;
+      }
+      return result;
+    } catch (err) {
+      result.success = false;
+      result.message = 'Connection failed';
+      return result;
     } finally {
       httpRequest.destroy();
     }

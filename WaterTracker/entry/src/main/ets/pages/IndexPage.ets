@@ -16,6 +16,13 @@ import { HASyncService } from '../service/HASyncService';
 import { ServerService } from '../service/ServerService';
 import { DayLog, WaterModel, ServerResponse, HydrationCurveData, CurveTarget, CurvePoint } from '../model/WaterModel';
 
+interface Padding {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}
+
 @Entry
 @Component
 struct IndexPage {
@@ -31,6 +38,9 @@ struct IndexPage {
   @State private serverMessage: string = '';
   @State private serverAmount: number = 0;
   @State private reminderMessage: string = '';
+  @State private velocityWarning: string = '';
+  @State private pacingMessage: string = '';
+  private velocityWarningUntil: number = 0;
 
   // ── Hydration curve panel ──
   @State private curveData: HydrationCurveData | null = null;
@@ -47,11 +57,13 @@ struct IndexPage {
   @State private reminderEnabled: boolean = false;
   @State private reminderInterval: number = Constants.DEFAULT_REMINDER_INTERVAL;
   @State private connectionStatus: string = '';
+  @State private serverConnectionStatus: string = '';
 
   // ── Navigation ──
   @State private activePanel: number = 1;
   private pollTimerId: number = -1;
   private reminderTimerId: number = -1;
+  private pacingTimerId: number = -1;
 
   // ── Settings editing states ──
   @State private editingGoal: boolean = false;
@@ -98,7 +110,10 @@ struct IndexPage {
   }
 
   private async loadCurveData(): Promise<void> {
-    // Curve data comes from server poll; if not yet available, leave null
+    // Generate local fallback if no server curve data available
+    if (this.curveData === null) {
+      this.generateLocalCurve();
+    }
     if (this.curveData !== null && this.curveReady) {
       this.drawHydrationCurve();
     }
@@ -127,11 +142,15 @@ struct IndexPage {
     this.pollServer();
     this.reminderTimerId = setInterval(() => { this.checkReminder(); }, Constants.REMINDER_CHECK_MS);
     this.checkReminder();
+    // Check pacing every 60s using locally cached curve data
+    this.pacingTimerId = setInterval(() => { this.checkPacing(); }, 60000);
+    this.checkPacing();
   }
 
   private stopTimers(): void {
     if (this.pollTimerId >= 0) { clearInterval(this.pollTimerId); this.pollTimerId = -1; }
     if (this.reminderTimerId >= 0) { clearInterval(this.reminderTimerId); this.reminderTimerId = -1; }
+    if (this.pacingTimerId >= 0) { clearInterval(this.pacingTimerId); this.pacingTimerId = -1; }
   }
 
   private async pollServer(): Promise<void> {
@@ -141,7 +160,8 @@ struct IndexPage {
       await ServerService.reportStatus();
       const ins: ServerResponse | null = await ServerService.fetchInstruction();
       if (ins !== null) {
-        if (ins.message.length > 0) {
+        // Only update server message if no velocity warning is active
+        if (ins.message.length > 0 && Date.now() > this.velocityWarningUntil) {
           this.serverMessage = ins.message;
           this.serverAmount = ins.recommended_amount;
         }
@@ -191,6 +211,16 @@ struct IndexPage {
     this.updateProgress();
     this.reminderMessage = '';
     this.serverMessage = '';
+
+    // Local overdrinking velocity check (last 60 min) — must run BEFORE server poll
+    this.checkVelocity(log);
+
+    // Update pacing based on cached curve (skip if velocity warning active)
+    if (this.velocityWarning === '') {
+      this.checkPacing();
+    }
+
+    // Sync to HA
     const isSyncEnabled: boolean = await StorageService.isHASyncEnabled();
     if (isSyncEnabled) {
       this.syncStatus = 'syncing';
@@ -198,6 +228,165 @@ struct IndexPage {
       this.syncStatus = ok ? 'synced' : 'offline';
       setTimeout(() => { this.syncStatus = ''; }, 2000);
     }
+
+    // Immediately report + fetch instruction from server after drinking
+    const serverOn: boolean = await StorageService.isServerEnabled();
+    if (serverOn) {
+      this.pollServer();
+    }
+  }
+
+  /**
+   * Local velocity check: warn if >800 ml consumed in the last 60 minutes.
+   * Based on renal excretion safety cap (800 ml/h, water_engine.py).
+   */
+  private checkVelocity(log: DayLog): void {
+    const now: number = Date.now();
+    const oneHourAgo: number = now - 3600000;
+    let recentMl: number = 0;
+    for (let i = 0; i < log.entries.length; i++) {
+      if (log.entries[i].timestamp >= oneHourAgo) {
+        recentMl += log.entries[i].amount;
+      }
+    }
+    if (recentMl > 800) {
+      this.velocityWarning = `⚠ ${recentMl} ml/h — zu schnell!`;
+      // Lock velocity warning for 30 seconds so server/pacing don't overwrite it
+      this.velocityWarningUntil = now + 30000;
+      // Clear conflicting messages while velocity is active
+      this.serverMessage = '';
+      this.pacingMessage = '';
+    } else if (now > this.velocityWarningUntil) {
+      // Only clear velocity warning after cooldown expires
+      this.velocityWarning = '';
+    }
+  }
+
+  /**
+   * Local pacing check using cached hydration curve data.
+   * Generates a deficit message if behind schedule, even between server polls.
+   */
+  private checkPacing(): void {
+    // Never override an active velocity warning with pacing info
+    if (Date.now() < this.velocityWarningUntil) {
+      this.pacingMessage = '';
+      return;
+    }
+    if (this.curveData === null) {
+      // Generate a simple local fallback curve if no server data
+      this.generateLocalCurve();
+    }
+    if (this.curveData === null) { return; }
+    const curve: HydrationCurveData = this.curveData;
+    // Update current_ml in cached curve to reflect latest intake
+    curve.current_ml = this.currentIntake;
+    const now: Date = new Date();
+    const currentHour: number = now.getHours() + now.getMinutes() / 60;
+    curve.current_hour = currentHour;
+
+    // Calculate expected intake at current hour (linear interpolation)
+    const wakeH: number = curve.wake_hour;
+    const sleepH: number = curve.sleep_hour;
+    const goalMl: number = curve.goal_ml > 0 ? curve.goal_ml : this.dailyGoal;
+    if (currentHour <= wakeH || currentHour >= sleepH) {
+      this.pacingMessage = '';
+      return;
+    }
+    const progress: number = (currentHour - wakeH) / (sleepH - wakeH);
+    const expectedMl: number = Math.round(goalMl * progress);
+    curve.current_expected_ml = expectedMl;
+    const deficit: number = expectedMl - this.currentIntake;
+
+    if (this.currentIntake >= goalMl) {
+      this.pacingMessage = '';
+    } else if (deficit > 500) {
+      this.pacingMessage = `${deficit} ml Rückstand!`;
+    } else if (deficit > 200) {
+      this.pacingMessage = `${deficit} ml hinter Plan`;
+    } else {
+      this.pacingMessage = '';
+    }
+
+    // Update local target badges
+    const remainingHours: number = Math.max(0.5, sleepH - currentHour);
+    const remainingMl: number = Math.max(0, goalMl - this.currentIntake);
+    const pacePerHour: number = remainingMl / remainingHours;
+    const intervals: number[] = [15, 30, 45, 60];
+    const labels: string[] = ["15'", "30'", "45'", "1h"];
+    const newTargets: CurveTarget[] = [];
+    for (let i = 0; i < intervals.length; i++) {
+      const mins: number = intervals[i];
+      const targetMl: number = Math.round(this.currentIntake + pacePerHour * (mins / 60));
+      const deltaMl: number = Math.max(0, Math.round(pacePerHour * (mins / 60)));
+      const t: CurveTarget = {
+        minutes: mins,
+        target_ml: Math.min(targetMl, goalMl),
+        delta_ml: this.currentIntake >= goalMl ? 0 : deltaMl,
+        label: labels[i]
+      };
+      newTargets.push(t);
+    }
+    curve.targets = newTargets;
+
+    // Redraw canvas if visible
+    if (this.curveReady) {
+      this.drawHydrationCurve();
+    }
+  }
+
+  /**
+   * Generates a simple local hydration curve when no server data is available.
+   * Uses linear pacing from wake(7h) to sleep(23h).
+   */
+  private generateLocalCurve(): void {
+    const now: Date = new Date();
+    const currentHour: number = now.getHours() + now.getMinutes() / 60;
+    const wakeH: number = 7;
+    const sleepH: number = 23;
+    const goalMl: number = this.dailyGoal;
+    const progress: number = currentHour > wakeH
+      ? Math.min((currentHour - wakeH) / (sleepH - wakeH), 1.0) : 0;
+    const expectedMl: number = Math.round(goalMl * progress);
+
+    // Build expected curve points (hourly)
+    const points: CurvePoint[] = [];
+    for (let hr = wakeH; hr <= sleepH; hr++) {
+      const p: number = (hr - wakeH) / (sleepH - wakeH);
+      const pt: CurvePoint = { hour: hr, ml: Math.round(goalMl * p) };
+      points.push(pt);
+    }
+
+    // Build targets
+    const remainingHours: number = Math.max(0.5, sleepH - currentHour);
+    const remainingMl: number = Math.max(0, goalMl - this.currentIntake);
+    const pacePerHour: number = remainingMl / remainingHours;
+    const intervals: number[] = [15, 30, 45, 60];
+    const labels: string[] = ["15'", "30'", "45'", "1h"];
+    const targets: CurveTarget[] = [];
+    for (let i = 0; i < intervals.length; i++) {
+      const mins: number = intervals[i];
+      const targetMl: number = Math.round(this.currentIntake + pacePerHour * (mins / 60));
+      const deltaMl: number = Math.max(0, Math.round(pacePerHour * (mins / 60)));
+      const t: CurveTarget = {
+        minutes: mins,
+        target_ml: Math.min(targetMl, goalMl),
+        delta_ml: this.currentIntake >= goalMl ? 0 : deltaMl,
+        label: labels[i]
+      };
+      targets.push(t);
+    }
+
+    const localCurve: HydrationCurveData = {
+      current_ml: this.currentIntake,
+      goal_ml: goalMl,
+      current_hour: currentHour,
+      current_expected_ml: expectedMl,
+      wake_hour: wakeH,
+      sleep_hour: sleepH,
+      targets: targets,
+      expected_curve: points
+    };
+    this.curveData = localCurve;
   }
 
   private async undoLast(): Promise<void> {
@@ -206,7 +395,14 @@ struct IndexPage {
     this.currentIntake = log.totalIntake;
     this.entryCount = log.entries.length;
     this.updateProgress();
+    // Reset velocity cooldown on undo so we re-evaluate cleanly
+    this.velocityWarningUntil = 0;
+    this.velocityWarning = '';
+    this.checkVelocity(log);
+    this.checkPacing();
     HASyncService.syncToHA(log);
+    const serverOn: boolean = await StorageService.isServerEnabled();
+    if (serverOn) { this.pollServer(); }
   }
 
   private getProgressColor(): string {
@@ -266,7 +462,7 @@ struct IndexPage {
     const ctx = this.curveCanvasCtx;
     const cw: number = 170;  // canvas width vp
     const ch: number = 88;   // canvas height vp
-    const pad = { left: 2, right: 2, top: 6, bottom: 14 };
+    const pad: Padding = { left: 2, right: 2, top: 6, bottom: 14 };
     const plotW: number = cw - pad.left - pad.right;
     const plotH: number = ch - pad.top - pad.bottom;
     const curve: HydrationCurveData = this.curveData;
@@ -436,21 +632,23 @@ struct IndexPage {
         .justifyContent(FlexAlign.SpaceBetween)
         .margin({ top: 4 })
       } else {
-        // No curve data yet — show placeholder
+        // No curve data yet — generate local fallback
         Column() {
           Text('⟳')
             .fontSize(24)
             .fontColor(Constants.COLOR_TEXT_SECONDARY)
             .margin({ top: 20 })
-          Text('Waiting for server...')
+          Text('Loading curve...')
             .fontSize(10)
             .fontColor(Constants.COLOR_TEXT_SECONDARY)
             .margin({ top: 6 })
-          Text('Enable Health Server in settings')
-            .fontSize(8)
-            .fontColor(Constants.COLOR_TEXT_SECONDARY)
-            .margin({ top: 2 })
         }
+        .onAppear(() => {
+          this.generateLocalCurve();
+          if (this.curveReady) {
+            this.drawHydrationCurve();
+          }
+        })
       }
     }
     .width('100%')
@@ -503,13 +701,30 @@ struct IndexPage {
             .fontColor(Constants.COLOR_TEXT_SECONDARY)
             .margin({ top: 1 })
 
-          if (this.serverMessage !== '') {
+          if (this.velocityWarning !== '') {
+            Text(this.velocityWarning)
+              .fontSize(7)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#FF3B30')
+              .textAlign(TextAlign.Center)
+              .maxLines(1)
+              .constraintSize({ maxWidth: 80 })
+              .margin({ top: 2 })
+          } else if (this.serverMessage !== '') {
             Text(this.serverMessage)
               .fontSize(7)
               .fontColor(Constants.COLOR_WARNING)
               .textAlign(TextAlign.Center)
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .constraintSize({ maxWidth: 80 })
+              .margin({ top: 2 })
+          } else if (this.pacingMessage !== '') {
+            Text(this.pacingMessage)
+              .fontSize(7)
+              .fontColor(Constants.COLOR_WARNING)
+              .textAlign(TextAlign.Center)
+              .maxLines(1)
               .constraintSize({ maxWidth: 80 })
               .margin({ top: 2 })
           } else if (this.reminderMessage !== '') {
@@ -929,33 +1144,72 @@ struct IndexPage {
           .clip(true)
 
           // ═══ Health Server ═══
-          Row() {
-            this.settingIcon('⬡', '#546E7A')
+          Column() {
+            Row() {
+              this.settingIcon('⛅', '#546E7A')
 
-            Text('Health Server')
-              .fontSize(15)
-              .fontWeight(FontWeight.Medium)
-              .fontColor(Constants.COLOR_TEXT_PRIMARY)
-              .layoutWeight(1)
+              Text('Health Server')
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(Constants.COLOR_TEXT_PRIMARY)
+                .layoutWeight(1)
 
-            Toggle({ type: ToggleType.Switch, isOn: this.serverEnabled })
-              .selectedColor(Constants.COLOR_PRIMARY)
-              .onChange((isOn: boolean) => {
-                this.serverEnabled = isOn;
-                StorageService.setServerEnabled(isOn);
-              })
+              Toggle({ type: ToggleType.Switch, isOn: this.serverEnabled })
+                .selectedColor(Constants.COLOR_PRIMARY)
+                .onChange((isOn: boolean) => {
+                  this.serverEnabled = isOn;
+                  StorageService.setServerEnabled(isOn);
+                  if (isOn) { this.pollServer(); }
+                })
+            }
+            .width('100%')
+            .height(60)
+            .padding({ left: 14, right: 14 })
+            .alignItems(VerticalAlign.Center)
+
+            if (this.serverEnabled) {
+              Divider()
+                .color(Constants.COLOR_PROGRESS_BG)
+                .margin({ left: 14, right: 14 })
+
+              Button('Test Connection')
+                .fontSize(13)
+                .fontWeight(FontWeight.Medium)
+                .height(42)
+                .borderRadius(21)
+                .backgroundColor(Constants.COLOR_PROGRESS_BG)
+                .fontColor(Constants.COLOR_TEXT_PRIMARY)
+                .width('80%')
+                .margin({ top: 8, bottom: 10 })
+                .onClick(async () => {
+                  this.serverConnectionStatus = 'Testing...';
+                  const result = await ServerService.testConnection();
+                  this.serverConnectionStatus = result.success ? '✓ Connected' : result.message;
+                  setTimeout(() => { this.serverConnectionStatus = ''; }, 3000);
+                })
+
+              if (this.serverConnectionStatus !== '') {
+                Text(this.serverConnectionStatus)
+                  .fontSize(12)
+                  .fontColor(
+                    this.serverConnectionStatus.startsWith('✓')
+                      ? Constants.COLOR_SUCCESS
+                      : Constants.COLOR_WARNING
+                  )
+                  .margin({ bottom: 8 })
+                  .textAlign(TextAlign.Center)
+                  .width('100%')
+              }
+            }
           }
-          .width('100%')
-          .height(60)
-          .padding({ left: 14, right: 14 })
-          .alignItems(VerticalAlign.Center)
           .backgroundColor(Constants.COLOR_SURFACE)
           .borderRadius(16)
           .margin({ bottom: 8 })
+          .clip(true)
 
           // ═══ Manage Entries ═══
           Row() {
-            this.settingIcon('☰', '#6A1B9A')
+            this.settingIcon('📋', '#6A1B9A')
 
             Text('Manage Entries')
               .fontSize(15)
