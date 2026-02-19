@@ -62,6 +62,7 @@ from app.core.water_engine import (
     detect_dehydration_from_vitals,
     hydration_bio_score_modifier,
     generate_hydration_curve,
+    generate_adaptive_curve,
 )
 
 router = APIRouter(prefix="/api")
@@ -596,6 +597,12 @@ async def water_report_endpoint(request: FastAPIRequest):
         now=now,
     )
 
+    adaptive_data = generate_adaptive_curve(
+        current_intake_ml=intake,
+        goal_ml=computed_goal,
+        now=now,
+    )
+
     velocity_warning = {
         "alert": velocity["alert"],
         "message": velocity.get("message", ""),
@@ -611,6 +618,7 @@ async def water_report_endpoint(request: FastAPIRequest):
         "daily_target_override": target_override,
         "timestamp": now.isoformat(),
         "hydration_curve": curve_data,
+        "adaptive_curve": adaptive_data,
         "velocity_warning": velocity_warning,
         "events_today": len(water_events),
     }
@@ -698,6 +706,13 @@ async def water_instruction_endpoint(
         now=now,
     )
 
+    # Generate adaptive catch-up curve
+    adaptive_data = generate_adaptive_curve(
+        current_intake_ml=intake,
+        goal_ml=computed_goal,
+        now=now,
+    )
+
     # Velocity warning as a separate structured field
     velocity_warning = {
         "alert": velocity["alert"],
@@ -714,6 +729,7 @@ async def water_instruction_endpoint(
         "daily_target_override": target_override,
         "timestamp": now.isoformat(),
         "hydration_curve": curve_data,
+        "adaptive_curve": adaptive_data,
         "velocity_warning": velocity_warning,
         "events_today": len(water_events),
     }

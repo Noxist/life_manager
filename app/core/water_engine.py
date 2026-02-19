@@ -522,3 +522,124 @@ def generate_hydration_curve(
         "targets": targets,
         "expected_curve": expected_curve,
     }
+
+
+# ── Adaptive hydration curve (catch-up plan) ─────────────────────────
+
+def generate_adaptive_curve(
+    current_intake_ml: int,
+    goal_ml: int,
+    now: Optional[datetime] = None,
+    wake_hour: float = 7.0,
+    sleep_hour: float = 23.0,
+    is_fasting: bool = USER_IS_FASTING,
+) -> dict:
+    """
+    Generate an adaptive hydration curve that recalculates the optimal
+    catch-up plan from NOW based on actual intake so far.
+
+    Unlike the static expected_curve (ideal pacing from wake_hour),
+    this curve starts at the user's real current_intake_ml and linearly
+    distributes the remaining ml across the remaining waking hours.
+
+    If the user is ahead of schedule, the curve flattens (less to drink).
+    If behind, the curve steepens (more per hour).
+
+    Returns:
+      - adaptive_curve: list of {hour, ml} points every 15 min from now→sleep
+      - catch_up_rate_ml_h: ml per hour needed to hit goal by sleep
+      - deficit_ml: how far behind the static schedule right now
+      - status: ahead / on_track / behind / critical
+      - ideal_curve: the static (original) expected intake curve for comparison
+
+    This is the curve that should go to the watch — it shows the user
+    a realistic plan, not just the ideal they already missed.
+    """
+    if now is None:
+        now = datetime.now()
+
+    current_hour = now.hour + now.minute / 60.0
+    if current_hour < wake_hour:
+        current_hour = wake_hour
+    if current_hour > sleep_hour:
+        current_hour = sleep_hour
+
+    remaining_ml = max(0, goal_ml - current_intake_ml)
+    remaining_hours = max(0.25, sleep_hour - current_hour)
+    catch_up_rate = remaining_ml / remaining_hours
+
+    # Cap at renal safety limit
+    capped_rate = min(catch_up_rate, float(WATER_MAX_HOURLY_ML))
+    achievable_ml = current_intake_ml + int(capped_rate * remaining_hours)
+
+    # Generate adaptive curve points (every 15 min from now to sleep)
+    adaptive_curve: list[dict] = []
+    step_minutes = 15
+    total_steps = int(remaining_hours * 60 / step_minutes) + 1
+    for i in range(total_steps):
+        h = current_hour + i * step_minutes / 60.0
+        if h > sleep_hour:
+            h = sleep_hour
+        elapsed_from_now = h - current_hour
+        adaptive_ml = current_intake_ml + int(capped_rate * elapsed_from_now)
+        adaptive_ml = min(adaptive_ml, goal_ml)
+        adaptive_curve.append({"hour": round(h, 2), "ml": adaptive_ml})
+
+    # Generate ideal curve for comparison (every 15 min from wake to sleep)
+    ideal_curve: list[dict] = []
+    ideal_steps = int((sleep_hour - wake_hour) * 60 / step_minutes) + 1
+    for i in range(ideal_steps):
+        h = wake_hour + i * step_minutes / 60.0
+        if h > sleep_hour:
+            h = sleep_hour
+        ideal_ml = int(expected_intake_at_hour(h, goal_ml, wake_hour, sleep_hour, is_fasting))
+        ideal_curve.append({"hour": round(h, 2), "ml": ideal_ml})
+
+    # Compute adaptive targets at 15/30/45/60 min
+    adaptive_targets: list[dict] = []
+    for minutes in [15, 30, 45, 60]:
+        t_hour = current_hour + minutes / 60.0
+        if t_hour > sleep_hour:
+            t_hour = sleep_hour
+        elapsed = t_hour - current_hour
+        target_ml = current_intake_ml + int(capped_rate * elapsed)
+        target_ml = min(target_ml, goal_ml)
+        delta_ml = max(0, target_ml - current_intake_ml)
+        label = f"{minutes}'" if minutes < 60 else "1h"
+        adaptive_targets.append({
+            "minutes": minutes,
+            "target_ml": target_ml,
+            "delta_ml": delta_ml,
+            "label": label,
+        })
+
+    # Status
+    expected_now = expected_intake_at_hour(current_hour, goal_ml, wake_hour, sleep_hour, is_fasting)
+    deficit = int(expected_now - current_intake_ml)
+    if current_intake_ml >= goal_ml:
+        status = "goal_reached"
+    elif deficit < -200:
+        status = "ahead"
+    elif deficit <= 200:
+        status = "on_track"
+    elif deficit <= 500:
+        status = "behind"
+    else:
+        status = "critical"
+
+    return {
+        "current_ml": current_intake_ml,
+        "goal_ml": goal_ml,
+        "achievable_ml": achievable_ml,
+        "current_hour": round(current_hour, 2),
+        "catch_up_rate_ml_h": round(capped_rate, 0),
+        "deficit_ml": deficit,
+        "status": status,
+        "remaining_hours": round(remaining_hours, 2),
+        "remaining_ml": remaining_ml,
+        "wake_hour": wake_hour,
+        "sleep_hour": sleep_hour,
+        "adaptive_curve": adaptive_curve,
+        "adaptive_targets": adaptive_targets,
+        "ideal_curve": ideal_curve,
+    }

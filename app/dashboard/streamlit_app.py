@@ -50,6 +50,14 @@ def api_delete(path: str) -> dict:
         return {}
 
 
+def _get_dash_weight() -> float:
+    """Get current user weight from API for display."""
+    w = api_get("/api/weight/latest")
+    if isinstance(w, dict) and w.get("found"):
+        return float(w.get("weight_kg", 96.0))
+    return 96.0
+
+
 # --- Plotly mobile-friendly helper ---
 PLOTLY_MOBILE_CONFIG = {
     "displayModeBar": False,
@@ -438,12 +446,13 @@ elif current_page == "hydration":
         if dehydration.get("alert"):
             st.error(dehydration.get("message", "Dehydrierungs-Warnung!"))
 
-        # ---- Pacing-Monitor (linear) ----
+        # ---- Pacing-Monitor (Soll vs. Ist + Adaptive Catch-Up) ----
         st.divider()
         st.subheader("Pacing-Monitor")
         st.caption(
-            "Soll-Kurve (blau) vs. Ist-Intake (grün). "
-            "Lineares Pacing über den Tag verteilt."
+            "Soll-Kurve (blau gestrichelt) = ideales Pacing. "
+            "Adaptive Kurve (orange) = realistischer Catch-Up-Plan ab jetzt. "
+            "Grün = tatsächlich getrunken."
         )
 
         now = datetime.now()
@@ -468,15 +477,15 @@ elif current_page == "hydration":
 
         fig_pace = go.Figure()
 
-        # Expected pacing (S-curve)
+        # Expected pacing (ideal linear)
         fig_pace.add_trace(go.Scatter(
             x=hours_range,
             y=expected_curve,
             mode="lines",
-            name="Soll (Pacing)",
+            name="Soll (Ideal)",
             line=dict(color="#4FC3F7", width=2, dash="dash"),
             fill="tozeroy",
-            fillcolor="rgba(79, 195, 247, 0.08)",
+            fillcolor="rgba(79, 195, 247, 0.05)",
         ))
 
         # Actual intake events as cumulative step line
@@ -508,6 +517,40 @@ elif current_page == "hydration":
                 marker=dict(size=6),
             ))
 
+        # Adaptive catch-up curve from API
+        adaptive = api_get("/api/water/instruction", {
+            "current_intake": intake_ml,
+            "daily_goal": goal_ml,
+        })
+        if isinstance(adaptive, dict) and adaptive.get("adaptive_curve"):
+            ac = adaptive["adaptive_curve"]
+            ac_curve = ac.get("adaptive_curve", [])
+            if ac_curve:
+                ac_hours = [p["hour"] for p in ac_curve]
+                ac_mls = [p["ml"] for p in ac_curve]
+                fig_pace.add_trace(go.Scatter(
+                    x=ac_hours,
+                    y=ac_mls,
+                    mode="lines",
+                    name="Catch-Up Plan",
+                    line=dict(color="#FF9800", width=3),
+                ))
+
+            # Show catch-up rate info
+            rate = ac.get("catch_up_rate_ml_h", 0)
+            ac_status = ac.get("status", "on_track")
+            deficit = ac.get("deficit_ml", 0)
+            remaining = ac.get("remaining_ml", 0)
+            remaining_h = ac.get("remaining_hours", 0)
+            if rate > 0 and ac_status != "goal_reached":
+                status_emoji = {"ahead": "++", "on_track": "OK", "behind": "!", "critical": "!!"}
+                st.info(
+                    f"[{status_emoji.get(ac_status, '?')}] "
+                    f"Catch-Up-Rate: {rate:.0f} ml/h | "
+                    f"Noch {remaining} ml in {remaining_h:.1f}h | "
+                    f"Defizit: {deficit} ml"
+                )
+
         # Current time marker
         fig_pace.add_vline(
             x=current_hour,
@@ -524,28 +567,8 @@ elif current_page == "hydration":
             annotation_font=dict(color="#FF9800"),
         )
 
-        # 15/30/45/60 min target markers ahead of current time
-        if current_hour >= wake_h and current_hour < sleep_h:
-            waking_total = sleep_h - wake_h
-            target_colors = ["#AB47BC", "#7E57C2", "#5C6BC0", "#42A5F5"]
-            for i, minutes in enumerate([15, 30, 45, 60]):
-                t_hour = min(current_hour + minutes / 60.0, sleep_h)
-                t_progress = (t_hour - wake_h) / waking_total
-                t_ml = int(goal_ml * t_progress)
-                label = f"{minutes}'" if minutes < 60 else "1h"
-                fig_pace.add_trace(go.Scatter(
-                    x=[t_hour], y=[t_ml],
-                    mode="markers+text",
-                    name=f"Ziel {label}",
-                    marker=dict(color=target_colors[i], size=10, symbol="diamond"),
-                    text=[f"{label}: {t_ml} ml"],
-                    textposition="top center",
-                    textfont=dict(size=10, color=target_colors[i]),
-                    showlegend=False,
-                ))
-
         fig_pace.update_layout(
-            title="Trink-Pacing (Soll vs. Ist)",
+            title="Trink-Pacing (Ideal vs. Catch-Up vs. Ist)",
             xaxis_title="Uhrzeit",
             yaxis_title="ml (kumuliert)",
             xaxis=dict(
@@ -554,7 +577,58 @@ elif current_page == "hydration":
                 ticktext=[f"{h}:00" for h in range(7, 24)],
             ),
         )
-        mobile_chart(fig_pace, height=380)
+        mobile_chart(fig_pace, height=400)
+
+        # ---- Goal History (Tagesbedarf-Veränderung) ----
+        st.divider()
+        st.subheader("Tagesbedarf-Verlauf")
+        st.caption("Wie sich dein Tagesbedarf über die letzten 7 Tage verändert hat.")
+        goal_hist = api_get("/api/water/goal/history", {"days": 7})
+        if isinstance(goal_hist, list) and goal_hist:
+            gdf = pd.DataFrame(goal_hist)
+            fig_goal = go.Figure()
+
+            fig_goal.add_trace(go.Scatter(
+                x=gdf["date"], y=gdf["goal_ml"],
+                mode="lines+markers+text",
+                name="Tagesziel",
+                line=dict(color="#4FC3F7", width=3),
+                marker=dict(size=8),
+                text=[f"{g}" for g in gdf["goal_ml"]],
+                textposition="top center",
+                textfont=dict(size=9),
+            ))
+
+            # Breakdown stacked area
+            if "base_ml" in gdf.columns:
+                fig_goal.add_trace(go.Bar(
+                    x=gdf["date"], y=gdf.get("base_ml", []),
+                    name="Basis", marker_color="rgba(79,195,247,0.4)",
+                ))
+            if "drug_mod_ml" in gdf.columns:
+                fig_goal.add_trace(go.Bar(
+                    x=gdf["date"], y=gdf.get("drug_mod_ml", []),
+                    name="Elvanse", marker_color="rgba(33,150,243,0.5)",
+                ))
+            if "fasting_mod_ml" in gdf.columns:
+                fig_goal.add_trace(go.Bar(
+                    x=gdf["date"], y=gdf.get("fasting_mod_ml", []),
+                    name="OMAD", marker_color="rgba(255,152,0,0.5)",
+                ))
+            if "activity_mod_ml" in gdf.columns:
+                fig_goal.add_trace(go.Bar(
+                    x=gdf["date"], y=gdf.get("activity_mod_ml", []),
+                    name="Aktivität", marker_color="rgba(76,175,80,0.5)",
+                ))
+
+            fig_goal.update_layout(
+                title="Tagesbedarf (7 Tage)",
+                yaxis_title="ml",
+                barmode="stack",
+            )
+            mobile_chart(fig_goal, height=320)
+        else:
+            st.caption("Noch keine Ziel-Historie vorhanden.")
 
         # ---- Quick-Add Wasser ----
         st.divider()
@@ -577,6 +651,31 @@ elif current_page == "hydration":
             if st.button("Log", use_container_width=True, key="wc_log"):
                 api_post("/api/water/intake", {"amount_ml": custom_ml})
                 st.rerun()
+
+        # ---- Historical water entry ----
+        with st.expander("Wasser nachtragen (historisch)"):
+            hw1, hw2 = st.columns(2)
+            with hw1:
+                hist_w_date = st.date_input("Datum", value=datetime.now().date(), key="hw_date")
+            with hw2:
+                hist_w_time = st.time_input("Uhrzeit", value=datetime.now().time().replace(second=0, microsecond=0), key="hw_time")
+            hw3, hw4 = st.columns(2)
+            with hw3:
+                hist_w_ml = st.number_input("Menge (ml)", min_value=25, max_value=2000, value=250, step=25, key="hw_ml")
+            with hw4:
+                hist_w_src = st.selectbox("Quelle", ["manual", "watch", "ha"], key="hw_src")
+            hist_w_notes = st.text_input("Notizen (optional)", key="hw_notes", placeholder="z.B. Tee, Suppe...")
+            if st.button("Nachtragen", type="primary", use_container_width=True, key="hw_submit"):
+                ts = datetime.combine(hist_w_date, hist_w_time).isoformat()
+                r = api_post("/api/water/intake", {
+                    "amount_ml": hist_w_ml,
+                    "source": hist_w_src,
+                    "notes": hist_w_notes,
+                    "timestamp": ts,
+                })
+                if r.get("status") == "ok":
+                    st.success(f"{hist_w_ml} ml nachgetragen ({hist_w_date} {hist_w_time.strftime('%H:%M')})")
+                    st.rerun()
 
         # ---- Reset ----
         with st.expander("Wasser zurücksetzen"):
@@ -606,13 +705,44 @@ elif current_page == "hydration":
         st.divider()
         st.subheader("Gewicht")
         weight_data = api_get("/api/weight/latest")
+        current_weight = 96.0
+        weight_source = "config"
         if isinstance(weight_data, dict) and weight_data.get("found"):
-            wkg = weight_data.get("weight_kg", "?")
-            wsrc = weight_data.get("source", "?")
-            st.metric("Aktuelles Gewicht", f"{wkg} kg", delta=f"Quelle: {wsrc}")
+            current_weight = float(weight_data.get("weight_kg", 96.0))
+            weight_source = weight_data.get("source", "?")
+            wts = weight_data.get("timestamp", "")
+            wts_display = wts[0:16].replace("T", " ") if len(wts) > 16 else wts
+            st.metric("Aktuelles Gewicht", f"{current_weight:.1f} kg")
+            st.caption(f"Quelle: {weight_source} | Zuletzt: {wts_display}")
+        else:
+            st.metric("Aktuelles Gewicht", f"{current_weight:.1f} kg")
+            st.caption("Quelle: Standardwert (kein Gewicht in DB)")
+
+        # Weight chart (last 30 days)
+        weight_history = api_get("/api/weight", {"days": 30})
+        if isinstance(weight_history, dict) and weight_history.get("history"):
+            wh = weight_history["history"]
+            if len(wh) > 1:
+                wdf = pd.DataFrame(wh)
+                wdf["time"] = pd.to_datetime(wdf["timestamp"])
+                fig_w = go.Figure()
+                fig_w.add_trace(go.Scatter(
+                    x=wdf["time"], y=wdf["weight_kg"],
+                    mode="lines+markers",
+                    line=dict(color="#AB47BC", width=2),
+                    marker=dict(size=5),
+                    name="Gewicht",
+                ))
+                fig_w.update_layout(
+                    title="Gewichtsverlauf (30 Tage)",
+                    yaxis_title="kg",
+                    xaxis_title="",
+                )
+                mobile_chart(fig_w, height=250)
+
         wc1, wc2 = st.columns(2)
         with wc1:
-            new_w = st.number_input("Neues Gewicht (kg)", min_value=50.0, max_value=200.0, value=96.0, step=0.1, key="nw")
+            new_w = st.number_input("Neues Gewicht (kg)", min_value=50.0, max_value=200.0, value=current_weight, step=0.1, key="nw")
         with wc2:
             st.write("")
             st.write("")
@@ -792,7 +922,7 @@ Normalisiert auf Peak = 1.0. Bei Mehrfacheinnahmen: lineare Superposition.
 
 ---
 
-**Allometrische Skalierung** (96 kg → 70 kg Referenz):
+**Allometrische Skalierung** (Gewicht → 70 kg Referenz):
 - Cmax\_user = Cmax\_ref × (70 / Gewicht) — Verteilungsvolumen ∝ Gewicht
 - Clearance = CL\_ref × (Gewicht / 70)^0.75
 
@@ -881,13 +1011,22 @@ elif current_page == "vitals":
                 mobile_chart(fig_hrv, height=280)
 
         if "steps" in hdf.columns and hdf["steps"].notna().any():
-            fig_steps = go.Figure()
-            fig_steps.add_trace(go.Bar(
-                x=hdf["time"], y=hdf["steps"],
-                marker_color="#4CAF50",
-            ))
-            fig_steps.update_layout(title="Schritte", yaxis_title="Steps")
-            mobile_chart(fig_steps, height=250)
+            # Show steps as line graph; drop midnight carryover artefacts by
+            # only keeping rows where steps changed from the previous snapshot
+            steps_df = hdf[hdf["steps"].notna()].copy()
+            if not steps_df.empty:
+                fig_steps = go.Figure()
+                fig_steps.add_trace(go.Scatter(
+                    x=steps_df["time"], y=steps_df["steps"],
+                    mode="lines+markers",
+                    line=dict(color="#4CAF50", width=2),
+                    marker=dict(size=4),
+                    fill="tozeroy",
+                    fillcolor="rgba(76,175,80,0.08)",
+                    name="Schritte",
+                ))
+                fig_steps.update_layout(title="Schritte", yaxis_title="Steps")
+                mobile_chart(fig_steps, height=250)
     else:
         st.info("Keine Daten für diesen Tag")
 
