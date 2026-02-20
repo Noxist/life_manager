@@ -235,15 +235,22 @@ def get_logs(
 def get_health(
     start: Optional[str] = None,
     end: Optional[str] = None,
+    source: Optional[str] = None,
+    today: Optional[bool] = None,
 ):
-    """Query health snapshots."""
-    if start and end:
-        return query_health_snapshots(start, end)
-    now = datetime.now()
-    return query_health_snapshots(
-        (now - timedelta(hours=24)).isoformat(),
-        now.isoformat(),
-    )
+    """Query health snapshots. Optional source filter (ha/watch/manual) and today shortcut."""
+    if today:
+        now = datetime.now()
+        start = now.strftime("%Y-%m-%dT00:00:00")
+        end = now.strftime("%Y-%m-%dT23:59:59")
+    elif not (start and end):
+        now = datetime.now()
+        start = (now - timedelta(hours=24)).isoformat()
+        end = now.isoformat()
+    rows = query_health_snapshots(start, end)
+    if source:
+        rows = [r for r in rows if r.get("source") == source]
+    return rows
 
 
 @router.get("/health/latest", dependencies=[Depends(verify_api_key)])

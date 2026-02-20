@@ -460,7 +460,7 @@ elif current_page == "hydration":
         wake_h = 7.0
         sleep_h = 23.0
 
-        # Linear expected curve (same as water_engine.py)
+        # Front-loaded expected curve (matches water_engine.py: t^0.85)
         hours_range = [h * 0.25 for h in range(int(wake_h * 4), int(sleep_h * 4) + 1)]
         expected_curve = []
         for h in hours_range:
@@ -472,12 +472,13 @@ elif current_page == "hydration":
                 continue
             waking_total = sleep_h - wake_h
             elapsed = h - wake_h
-            progress_val = elapsed / waking_total
+            t = elapsed / waking_total
+            progress_val = t ** 0.85  # front-loaded: steeper morning, gentler evening
             expected_curve.append(int(goal_ml * progress_val))
 
         fig_pace = go.Figure()
 
-        # Expected pacing (ideal linear)
+        # Expected pacing (front-loaded t^0.85)
         fig_pace.add_trace(go.Scatter(
             x=hours_range,
             y=expected_curve,
@@ -958,6 +959,7 @@ elif current_page == "vitals":
         spo2 = latest_h.get("spo2")
         steps_val = latest_h.get("steps")
         cals = latest_h.get("calories")
+        src = latest_h.get("source", "?")
 
         if hr:
             v1.metric("HR", f"{hr:.0f} bpm")
@@ -977,7 +979,8 @@ elif current_page == "vitals":
             v7.metric("Kalorien", f"{cals:.0f} kcal")
 
         ts_str = latest_h.get("timestamp", "")
-        st.caption(f"Aktualisiert: {ts_str[11:16] if len(ts_str) > 16 else ts_str} (alle 15 Min)")
+        src_label = {"ha": "Home Assistant", "watch": "Huawei Watch", "manual": "Manuell"}.get(src, src)
+        st.caption(f"Aktualisiert: {ts_str[11:16] if len(ts_str) > 16 else ts_str} | Quelle: {src_label}")
     else:
         st.info("Noch keine Daten")
 
@@ -989,15 +992,39 @@ elif current_page == "vitals":
     if isinstance(health, list) and health:
         hdf = pd.DataFrame(health)
         hdf["time"] = pd.to_datetime(hdf["timestamp"])
+        has_source = "source" in hdf.columns
+
+        # Source summary
+        if has_source:
+            src_counts = hdf["source"].value_counts().to_dict()
+            src_parts = []
+            src_names = {"ha": "Home Assistant", "watch": "Huawei Watch", "manual": "Manuell"}
+            for s, c in sorted(src_counts.items()):
+                src_parts.append(f"{src_names.get(s, s)}: {c}")
+            st.caption(f"Datenpunkte: {len(hdf)} ({', '.join(src_parts)})")
+
+        # Color map for sources
+        SRC_COLORS = {"ha": "#F44336", "watch": "#00BCD4", "manual": "#FF9800"}
 
         h1, h2 = st.columns(2)
         with h1:
             if "heart_rate" in hdf.columns and hdf["heart_rate"].notna().any():
                 fig_hr = go.Figure()
-                fig_hr.add_trace(go.Scatter(
-                    x=hdf["time"], y=hdf["heart_rate"],
-                    mode="lines+markers", line=dict(color="#F44336"),
-                ))
+                if has_source:
+                    for src_name, grp in hdf[hdf["heart_rate"].notna()].groupby("source"):
+                        label = {"ha": "HR (HA)", "watch": "HR (Watch)", "manual": "HR (Manuell)"}.get(str(src_name), f"HR ({src_name})")
+                        fig_hr.add_trace(go.Scatter(
+                            x=grp["time"], y=grp["heart_rate"],
+                            mode="lines+markers",
+                            name=label,
+                            line=dict(color=SRC_COLORS.get(str(src_name), "#F44336")),
+                            marker=dict(size=4),
+                        ))
+                else:
+                    fig_hr.add_trace(go.Scatter(
+                        x=hdf["time"], y=hdf["heart_rate"],
+                        mode="lines+markers", line=dict(color="#F44336"),
+                    ))
                 fig_hr.update_layout(title="Herzfrequenz", yaxis_title="bpm")
                 mobile_chart(fig_hr, height=280)
         with h2:
@@ -1009,6 +1036,23 @@ elif current_page == "vitals":
                 ))
                 fig_hrv.update_layout(title="HRV", yaxis_title="ms")
                 mobile_chart(fig_hrv, height=280)
+
+        # Resting HR comparison (watch vs HA)
+        if "resting_hr" in hdf.columns and hdf["resting_hr"].notna().any() and has_source:
+            rhr_df = hdf[hdf["resting_hr"].notna()]
+            if len(rhr_df["source"].unique()) > 1:
+                fig_rhr = go.Figure()
+                for src_name, grp in rhr_df.groupby("source"):
+                    label = {"ha": "Ruhe-HR (HA)", "watch": "Ruhe-HR (Watch)"}.get(str(src_name), f"Ruhe-HR ({src_name})")
+                    fig_rhr.add_trace(go.Scatter(
+                        x=grp["time"], y=grp["resting_hr"],
+                        mode="lines+markers",
+                        name=label,
+                        line=dict(color=SRC_COLORS.get(str(src_name), "#9C27B0")),
+                        marker=dict(size=4),
+                    ))
+                fig_rhr.update_layout(title="Ruhe-Herzfrequenz (Vergleich)", yaxis_title="bpm")
+                mobile_chart(fig_rhr, height=250)
 
         if "steps" in hdf.columns and hdf["steps"].notna().any():
             # Show steps as line graph; drop midnight carryover artefacts by
